@@ -1,0 +1,9 @@
+# nv-segment-ctmr-mcp — Horizon container dependencies
+#
+# No pixel data is processed here. This container resolves structure names,
+# validates URIs, and brokers jobs to Modal. No torch, no MONAI, no nibabel,
+# no model weights.
+
+fastmcp[tasks]>=3.2.4
+requests>=2.31
+pydantic>=2.0
