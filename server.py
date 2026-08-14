@@ -183,6 +183,33 @@ def _validate_indices(indices: list[int]) -> list[str]:
     return problems
 
 
+def _validate_presigned(url: str, field: str) -> str | None:
+    """
+    Reject anything that isn't a presigned https URL.
+
+    Raw s3:// URIs would require credentials somewhere in the pipeline; the
+    whole point of the presigned design is that neither this container nor
+    the Modal container holds any. Failing here gives a clear message instead
+    of a 403 six minutes into a GPU job.
+    """
+    if not url or not isinstance(url, str):
+        return f"{field} is required."
+    if url.startswith("s3://"):
+        return (
+            f"{field} must be a presigned https URL, not a raw s3:// URI. "
+            "Nothing in this pipeline holds AWS credentials by design — "
+            "generate a presigned URL scoped to the single object."
+        )
+    if not url.startswith("https://"):
+        return f"{field} must be an https:// URL."
+    if "X-Amz-Signature" not in url and "Signature=" not in url:
+        return (
+            f"{field} does not look presigned (no signature in the query "
+            "string). An unsigned bucket URL will 403."
+        )
+    return None
+
+
 def _absolute_download_url(result: dict) -> str | None:
     path = result.get("mask_download_path")
     return f"{MODAL_API_URL}{path}" if path else None
@@ -221,7 +248,7 @@ def _summarize(
         "job_id": result.get("job_id"),
         "study_id": result.get("study_id"),
         "mask_download_url": _absolute_download_url(result),
-        "mask_s3_uri": result.get("mask_s3_uri"),
+        "mask_uploaded_to_presigned_url": bool(result.get("mask_uploaded")),
         "mask_size_mb": round((result.get("mask_bytes") or 0) / 1024**2, 2),
         "volume_shape": result.get("shape"),
         "voxel_volume_mm3": result.get("voxel_volume_mm3"),
@@ -362,11 +389,10 @@ async def check_image_uri(image_uri: str) -> str:
 
     Issues a HEAD request to confirm the URI resolves and reports the declared
     size and content type. Catches expired presigned links and typo'd paths
-    without cold-starting the inference container. Only works for http(s);
-    s3:// URIs are reported as unverifiable from here.
+    without cold-starting the inference container.
 
     Args:
-        image_uri:  URL of a .nii or .nii.gz volume. Presigned S3/GCS URLs work.
+        image_uri:  Presigned https:// GET URL for a .nii or .nii.gz object.
 
     Returns:
         JSON with reachability, size, and a rough runtime expectation.
@@ -375,21 +401,21 @@ async def check_image_uri(image_uri: str) -> str:
         if image_uri.startswith("s3://"):
             return json.dumps(
                 {
-                    "success": True,
-                    "scheme": "s3",
-                    "verified": False,
-                    "note": (
-                        "s3:// URIs are resolved with credentials inside the "
-                        "inference container and cannot be checked from here."
+                    "success": False,
+                    "reason": (
+                        "Raw s3:// URIs are not supported anywhere in this "
+                        "pipeline — no component holds AWS credentials. "
+                        "Generate a presigned GET URL scoped to the single "
+                        "object and pass that instead."
                     ),
                 }
             )
 
-        if not image_uri.startswith(("http://", "https://")):
+        if not image_uri.startswith("https://"):
             return json.dumps(
                 {
                     "success": False,
-                    "reason": "Only https://, http://, and s3:// URIs are supported.",
+                    "reason": "image_uri must be an https:// URL.",
                 }
             )
 
@@ -427,7 +453,7 @@ async def segment_structures(
     wait_s: int = DEFAULT_WAIT_S,
     max_structures: int = DEFAULT_MAX_STRUCTURES,
     include_bboxes: bool = False,
-    output_s3_uri: str | None = None,
+    output_put_url: str | None = None,
 ) -> str:
     """
     Segment specific named anatomical structures in a 3D CT or MR volume.
@@ -444,7 +470,9 @@ async def segment_structures(
     elapses, returns a call_id — pass it to get_segmentation_status.
 
     Args:
-        image_uri:       https:// (presigned ok) or s3:// URI of a .nii/.nii.gz.
+        image_uri:       Presigned https:// GET URL for a single .nii/.nii.gz
+                         object. Raw s3:// URIs are not accepted — nothing in
+                         this pipeline holds AWS credentials.
         study_id:        Identifier for this study; used in output paths and logs.
         structures:      Structure names, e.g. ["liver", "spleen", "aorta"].
                          Resolved against the model vocabulary; call
@@ -453,7 +481,9 @@ async def segment_structures(
         wait_s:          Seconds to poll before handing back a call_id (default 240).
         max_structures:  Cap on the returned structure table (default 40).
         include_bboxes:  Include per-structure voxel bounding boxes (default False).
-        output_s3_uri:   Optional s3://bucket/prefix to mirror the mask to.
+        output_put_url:  Optional presigned https:// PUT URL for a single output
+                         object. The mask is uploaded there in addition to the
+                         Modal volume.
 
     Returns:
         JSON with per-structure volumes, a mask download URL, and timings —
@@ -467,6 +497,14 @@ async def segment_structures(
                     "reason": "Provide either structures (names) or label_indices.",
                 }
             )
+
+        uri_problem = _validate_presigned(image_uri, "image_uri")
+        if uri_problem:
+            return json.dumps({"success": False, "reason": uri_problem})
+        if output_put_url:
+            put_problem = _validate_presigned(output_put_url, "output_put_url")
+            if put_problem:
+                return json.dumps({"success": False, "reason": put_problem})
 
         if label_indices:
             indices = [int(i) for i in label_indices]
@@ -497,8 +535,8 @@ async def segment_structures(
             "label_prompt": indices,
             "compute_stats": True,
         }
-        if output_s3_uri:
-            payload["output_s3_uri"] = output_s3_uri
+        if output_put_url:
+            payload["output_put_url"] = output_put_url
 
         # Peak VRAM scales with simultaneous prompt count, not model size.
         if len(indices) > ASYNC_PROMPT_THRESHOLD:
@@ -538,7 +576,7 @@ async def segment_everything(
     modality: Literal["CT_BODY", "MRI_BODY", "MRI_BRAIN"],
     brain_preprocessed: bool = False,
     label_chunk_size: int = 16,
-    output_s3_uri: str | None = None,
+    output_put_url: str | None = None,
 ) -> str:
     """
     Run whole-body (or whole-brain) automatic segmentation over a volume.
@@ -553,19 +591,27 @@ async def segment_everything(
     so brain_preprocessed must be set True to acknowledge this.
 
     Args:
-        image_uri:          https:// (presigned ok) or s3:// URI of a .nii/.nii.gz.
+        image_uri:          Presigned https:// GET URL for a single .nii/.nii.gz.
         study_id:           Identifier for this study.
         modality:           CT_BODY, MRI_BODY, or MRI_BRAIN.
         brain_preprocessed: Required True for MRI_BRAIN — confirms the volume is
                             skull-stripped and normalized.
         label_chunk_size:   Prompts per forward pass; lower to cut peak VRAM
                             (default 16, 0 disables chunking).
-        output_s3_uri:      Optional s3://bucket/prefix to mirror the mask to.
+        output_put_url:     Optional presigned https:// PUT URL for the mask.
 
     Returns:
         JSON with a call_id to poll.
     """
     try:
+        uri_problem = _validate_presigned(image_uri, "image_uri")
+        if uri_problem:
+            return json.dumps({"success": False, "reason": uri_problem})
+        if output_put_url:
+            put_problem = _validate_presigned(output_put_url, "output_put_url")
+            if put_problem:
+                return json.dumps({"success": False, "reason": put_problem})
+
         if modality == "MRI_BRAIN" and not brain_preprocessed:
             return json.dumps(
                 {
@@ -587,8 +633,8 @@ async def segment_everything(
             "label_chunk_size": int(label_chunk_size),
             "compute_stats": True,
         }
-        if output_s3_uri:
-            payload["output_s3_uri"] = output_s3_uri
+        if output_put_url:
+            payload["output_put_url"] = output_put_url
 
         submitted = _modal_post("/jobs", payload)
         call_id = submitted["call_id"]
